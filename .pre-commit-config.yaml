@@ -260,3 +260,5 @@ repos:
         files: \.pkr\.hcl
         # Override the name to include mention of Packer
         name: Terraform docs (Packer templates)
+
+# Sandbox: harmless upstream change (2026-11-05T19:41:09Z)
