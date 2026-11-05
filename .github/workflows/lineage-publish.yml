@@ -65,7 +65,7 @@ jobs:
       # evaluate it here and test the env var instead
       HAS_APP: ${{ secrets.LINEAGE_PUBLISH_APP_ID != '' }}
     steps:
-      - uses: actions/create-github-app-token@v1
+      - uses: actions/create-github-app-token@v3
         id: app
         if: env.HAS_APP == 'true'
         with:
