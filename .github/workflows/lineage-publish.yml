@@ -1,0 +1,127 @@
+# Drop into .github/workflows/ of a linearized repo (skeleton layer
+# only — NOT project repos with outside contributors; design.md
+# "Scope"). Merging the lineage/sync PR publishes: this workflow
+# force-pushes the REVIEWED head SHA to develop, leased against the
+# snapshot the sync was built on, then deletes the decoy base.
+#
+# Setup (once per repo/org — lineage-rework/design.md "Setup checklist"):
+#   1. A GitHub App with contents:write + pull-requests:write,
+#      installed on the repo, listed as bypass actor on develop's
+#      ruleset (ci/rulesets/).
+#   2. An environment named `lineage-publish` holding the secrets
+#      LINEAGE_PUBLISH_APP_ID and LINEAGE_PUBLISH_APP_KEY. Optional:
+#      required reviewers on the environment add a second approval.
+#   3. This file merged to develop via a normal PR BEFORE the first
+#      sync cycle. pull_request_target runs the DEFAULT branch's copy
+#      of this workflow, so neither the sync branch nor the decoy can
+#      alter the workflow that holds the credential.
+#
+# Sandbox mode: when the App secrets are absent, the job falls back
+# to GITHUB_TOKEN (see `permissions` below). That only works where
+# develop has no force-push protection — i.e. a playground repo —
+# because GITHUB_TOKEN can never bypass rulesets. Production uses the
+# App.
+#
+# The workflow moves a ref; it creates no commits. Signed-commit and
+# linear-history rules on develop still apply to what it pushes.
+
+name: lineage-publish
+
+on:
+  pull_request_target:
+    types: [closed]
+
+permissions: {}
+
+concurrency:
+  group: lineage-publish-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # Only a MERGED PR, from this repo's own lineage/sync branch,
+    # into a decoy base. Anything else (closed-not-merged, forks,
+    # retargeted PRs) is ignored.
+    if: >
+      github.event.pull_request.merged == true &&
+      github.event.pull_request.head.ref == 'lineage/sync' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      startsWith(github.event.pull_request.base.ref, 'lineage/sync-base-')
+    runs-on: ubuntu-latest
+    environment: lineage-publish
+    # Only used by the sandbox GITHUB_TOKEN fallback; the App token
+    # path ignores these.
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write # PR comments go through the issues API
+    env:
+      BRANCH: develop
+      BASE_REF: ${{ github.event.pull_request.base.ref }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+      PR: ${{ github.event.pull_request.number }}
+    steps:
+      - uses: actions/create-github-app-token@v1
+        id: app
+        if: ${{ secrets.LINEAGE_PUBLISH_APP_ID != '' }}
+        with:
+          app-id: ${{ secrets.LINEAGE_PUBLISH_APP_ID }}
+          private-key: ${{ secrets.LINEAGE_PUBLISH_APP_KEY }}
+
+      - name: Publish the reviewed SHA to develop (leased)
+        env:
+          TOKEN: ${{ steps.app.outputs.token || github.token }}
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          set -euo pipefail
+          git init -q repo && cd repo
+          git remote add origin \
+            "https://x-access-token:${TOKEN}@github.com/${{ github.repository }}.git"
+          git fetch -q origin "$MERGE_SHA" "refs/heads/$BRANCH"
+
+          # The $BRANCH snapshot the sync was built on: full SHA from
+          # the PR-body marker, cross-checked against the decoy's
+          # name. The lease below is the real guard — publish happens
+          # only if $BRANCH still equals this value — so a wrong
+          # marker can't overwrite anything, only refuse.
+          snap=$(printf '%s' "$BODY" \
+            | grep -oE 'lineage-sync:base=[0-9a-f]{40}' | head -1 | cut -d= -f2)
+          embedded="${BASE_REF#lineage/sync-base-}"
+          case "$snap" in
+            "$embedded"*) ;;
+            *) echo "::error::PR body base marker ($snap) does not match the decoy name ($embedded) — not publishing"
+               exit 1;;
+          esac
+          # The reviewed head must be the merge's second parent.
+          [ "$(git rev-parse "${MERGE_SHA}^2")" = "$HEAD_SHA" ] || {
+            echo "::error::merge second parent != event head SHA — not publishing"
+            exit 1
+          }
+
+          # The force-push. The lease fails (instead of destroying
+          # work) if anything reached $BRANCH since the snapshot.
+          git push --force-with-lease="refs/heads/$BRANCH:$snap" \
+            origin "$HEAD_SHA:refs/heads/$BRANCH"
+          echo "published: $BRANCH ${snap:0:12} → ${HEAD_SHA:0:12}"
+
+          # Retire the review branches: the decoy, and the sync
+          # branch (its content now IS develop; leaving it would trip
+          # the next cycle's no-clobber check).
+          git push origin ":refs/heads/$BASE_REF" || true
+          git push origin ":refs/heads/lineage/sync" || true
+
+      - name: Comment success
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh pr comment "$PR" --body "✅ Published: \`$BRANCH\` force-updated to the reviewed \`${HEAD_SHA:0:12}\` (lease held against \`${BASE_REF#lineage/sync-base-}\`). Decoy base deleted. Consumers of this repo: \`git pull --rebase\`, not \`git pull\`."
+
+      - name: Comment failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh pr comment "$PR" --body "⚠️ Publish did **not** happen (likely: \`$BRANCH\` moved during review, so the lease refused — nothing was overwritten). \`$BRANCH\` is untouched; this merge only reached the decoy snapshot. Recover: \`scripts/sync.sh --fresh <repo>\` → \`--push\` for a fresh PR, or break-glass per runbook §8. Check the run log for details."

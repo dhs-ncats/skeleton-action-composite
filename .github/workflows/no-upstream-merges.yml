@@ -1,0 +1,58 @@
+# Drop into .github/workflows/ of a linearized repo.
+# Fails a PR if it introduces a merge commit whose second parent comes
+# from the upstream skeleton — i.e., someone merged instead of rebased.
+#
+# Reads the upstream URL from .github/lineage.yml so this file is the
+# same in every repo.
+
+name: no-upstream-merges
+
+on:
+  pull_request:
+    branches: [develop]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read upstream from lineage.yml
+        id: lineage
+        run: |
+          url=$(sed -n 's|.*remote-url: *\(.*\)|\1|p' .github/lineage.yml | head -1)
+          if [ -z "$url" ]; then
+            echo "No lineage.yml upstream; skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch upstream
+        if: steps.lineage.outputs.skip != 'true'
+        run: |
+          git remote add upstream "${{ steps.lineage.outputs.url }}"
+          git fetch --quiet upstream
+
+      - name: Reject merge-from-upstream commits in this PR
+        if: steps.lineage.outputs.skip != 'true'
+        run: |
+          base='${{ github.event.pull_request.base.sha }}'
+          head='${{ github.event.pull_request.head.sha }}'
+          bad=0
+          while read -r m p1 p2 rest; do
+            [ -n "$p2" ] || continue
+            for p in $p2 $rest; do
+              if git merge-base --is-ancestor "$p" upstream/HEAD 2>/dev/null; then
+                echo "::error::Merge commit $m pulls from upstream ($p)."
+                echo "::error::This repo is linearized — rebase onto upstream instead of merging (see runbook §5)."
+                bad=1
+              fi
+            done
+          done < <(git rev-list --merges --parents "$base..$head")
+          exit $bad
