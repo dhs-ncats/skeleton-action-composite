@@ -62,7 +62,7 @@ jobs:
       MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
       PR: ${{ github.event.pull_request.number }}
     steps:
-      - uses: actions/create-github-app-token@v1
+      - uses: actions/create-github-app-token@v3
         id: app
         if: ${{ secrets.LINEAGE_PUBLISH_APP_ID != '' }}
         with:
